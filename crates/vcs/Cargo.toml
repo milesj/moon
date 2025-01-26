@@ -14,6 +14,15 @@ moon_process = { path = "../process" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 git-url-parse = "0.4.5"
+gix = { version = "0.69.1", default-features = false, features = [
+	# ignore
+	"excludes",
+	# rev-parse
+	"revision",
+	# other
+	"max-performance-safe",
+	"tracing",
+] }
 ignore = "0.4.23"
 miette = { workspace = true }
 once_cell = { workspace = true }

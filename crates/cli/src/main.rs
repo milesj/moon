@@ -49,6 +49,11 @@ fn get_tracing_modules() -> Vec<String> {
         modules.push("extism::pdk".into());
     }
 
+    #[cfg(debug_assertions)]
+    {
+        modules.push("gix".into());
+    }
+
     modules
 }
 

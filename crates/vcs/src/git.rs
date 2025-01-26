@@ -4,8 +4,10 @@ use crate::process_cache::ProcessCache;
 use crate::touched_files::TouchedFiles;
 use crate::vcs::Vcs;
 use async_trait::async_trait;
+use core::convert::From;
+use gix::{worktree, ThreadSafeRepository};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use miette::Diagnostic;
+use miette::{Diagnostic, IntoDiagnostic};
 use moon_common::path::{RelativePathBuf, WorkspaceRelativePathBuf};
 use moon_common::{is_test_env, Style, Stylize};
 use once_cell::sync::Lazy;
@@ -122,6 +124,14 @@ pub struct Git {
     /// Map of submodules within the repository.
     /// The root is also considered a module to keep things easy.
     modules: BTreeMap<String, GitModule>,
+
+    // NEW
+    repository: ThreadSafeRepository,
+
+    /// Output cache of all executed commands.
+    exec_cache: scc::HashCache<String, Arc<String>>,
+
+    ignored_list: worktree::ignore::Search,
 }
 
 impl Git {
@@ -133,6 +143,23 @@ impl Git {
         debug!("Using git as a version control system");
 
         let workspace_root = workspace_root.as_ref();
+
+        let repository = ThreadSafeRepository::discover(workspace_root).unwrap();
+
+        dbg!(
+            &repository,
+            repository.git_dir(),
+            repository.objects_dir(),
+            repository.work_dir(),
+        );
+
+        let mut buf = vec![];
+        let ignored_list = worktree::ignore::Search::from_git_dir(
+            repository.git_dir(),
+            repository.work_dir().map(|dir| dir.join(".gitignore")),
+            &mut buf,
+        )
+        .unwrap();
 
         debug!(
             starting_dir = ?workspace_root,
@@ -257,6 +284,10 @@ impl Git {
             git_root,
             worktree,
             modules,
+            // NEW
+            exec_cache: scc::HashCache::new(),
+            ignored_list,
+            repository,
         };
 
         Ok(git)
@@ -580,22 +611,82 @@ impl Git {
 
         file
     }
+
+    async fn exec<F>(&self, key: impl AsRef<str>, op: F) -> miette::Result<Arc<String>>
+    where
+        F: Fn(gix::Repository) -> miette::Result<String>,
+    {
+        use scc::hash_cache::Entry;
+
+        let cache_key = key.as_ref().to_owned();
+
+        // First check if the data has already been cached
+        if let Some(cache) = self
+            .exec_cache
+            .read_async(&cache_key, |_, v| v.clone())
+            .await
+        {
+            return Ok(cache);
+        }
+
+        // Otherwise acquire an entry to lock the row
+        let cache = match self.exec_cache.entry_async(cache_key.clone()).await {
+            Entry::Occupied(o) => o.get().clone(),
+            Entry::Vacant(v) => {
+                let repo = self.repository.to_thread_local();
+                let value = op(repo)?;
+
+                dbg!(cache_key, &value);
+
+                let cache = Arc::new(value);
+
+                v.put_entry(Arc::clone(&cache));
+
+                cache
+            }
+        };
+
+        Ok(cache)
+    }
 }
 
 #[async_trait]
 impl Vcs for Git {
     async fn get_local_branch(&self) -> miette::Result<Arc<String>> {
-        if self.is_version_supported(">=2.22.0").await? {
-            return self.process.run(["branch", "--show-current"], true).await;
-        }
+        // if self.is_version_supported(">=2.22.0").await? {
+        //     return self.process.run(["branch", "--show-current"], true).await;
+        // }
 
-        self.process
-            .run(["rev-parse", "--abbrev-ref", "HEAD"], true)
-            .await
+        // self.process
+        //     .run(["rev-parse", "--abbrev-ref", "HEAD"], true)
+        //     .await
+        self.exec("local_branch", |repo| {
+            if let Ok(Some(name)) = repo.head_name() {
+                return Ok(name.shorten().to_string());
+            }
+
+            let rev = repo.rev_parse("HEAD").into_diagnostic()?;
+            let name = rev
+                .first_reference()
+                .or_else(|| rev.second_reference())
+                .and_then(|rf| rf.target.try_name());
+
+            Ok(match name {
+                Some(name) => name.shorten().to_string(),
+                // Can't deduce the branch/ref name,
+                // so return the revision SHA as a fallback
+                None => rev.to_string(),
+            })
+        })
+        .await
     }
 
     async fn get_local_branch_revision(&self) -> miette::Result<Arc<String>> {
-        self.process.run(["rev-parse", "HEAD"], true).await
+        // self.process.run(["rev-parse", "HEAD"], true).await
+        self.exec("local_branch_revision", |repo| {
+            Ok(repo.rev_parse("HEAD").into_diagnostic()?.to_string())
+        })
+        .await
     }
 
     async fn get_default_branch(&self) -> miette::Result<Arc<String>> {
@@ -603,9 +694,16 @@ impl Vcs for Git {
     }
 
     async fn get_default_branch_revision(&self) -> miette::Result<Arc<String>> {
-        self.process
-            .run(["rev-parse", &self.default_branch], true)
-            .await
+        // self.process
+        //     .run(["rev-parse", &self.default_branch], true)
+        //     .await
+        self.exec("default_branch_revision", |repo| {
+            Ok(repo
+                .rev_parse(self.default_branch.as_str())
+                .into_diagnostic()?
+                .to_string())
+        })
+        .await
     }
 
     #[instrument(skip_all)]
@@ -858,31 +956,43 @@ impl Vcs for Git {
     }
 
     fn is_enabled(&self) -> bool {
-        self.git_root.exists()
+        self.repository.git_dir().exists()
     }
 
     fn is_ignored(&self, file: &Path) -> bool {
-        if let Some(ignore) = &self.ignore {
-            ignore.matched(file, false).is_ignore()
-        } else {
-            false
-        }
+        use gix::bstr::BStr;
+        use gix::glob::pattern::Case;
+
+        // if let Some(ignore) = &self.ignore {
+        //     ignore.matched(file, false).is_ignore()
+        // } else {
+        //     false
+        // }
+
+        // TODO
+        let rel_file = file.strip_prefix(&self.repository_root).unwrap_or(file);
+        let rel_file_str = BStr::new(rel_file.as_os_str().as_encoded_bytes());
+
+        self.ignored_list
+            .pattern_matching_relative_path(&rel_file_str, Some(file.is_dir()), Case::Sensitive)
+            .is_some()
     }
 
     async fn is_shallow_checkout(&self) -> miette::Result<bool> {
-        let result = if self.is_version_supported(">=2.15.0").await? {
-            let result = self
-                .process
-                .run(["rev-parse", "--is-shallow-repository"], true)
-                .await?;
+        // let result = if self.is_version_supported(">=2.15.0").await? {
+        //     let result = self
+        //         .process
+        //         .run(["rev-parse", "--is-shallow-repository"], true)
+        //         .await?;
 
-            result.as_str() == "true"
-        } else {
-            let result = self.process.run(["rev-parse", "--git-dir"], true).await?;
+        //     result.as_str() == "true"
+        // } else {
+        //     let result = self.process.run(["rev-parse", "--git-dir"], true).await?;
 
-            result.contains("shallow")
-        };
+        //     result.contains("shallow")
+        // };
 
-        Ok(result)
+        // Ok(result)
+        Ok(self.repository.to_thread_local().is_shallow())
     }
 }

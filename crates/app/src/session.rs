@@ -277,6 +277,13 @@ impl AppSession for CliSession {
             startup::signin_to_moonbase(&vcs).await?;
         }
 
+        let vcs = self.get_vcs_adapter()?;
+
+        dbg!(vcs.get_local_branch().await?);
+        dbg!(vcs.get_local_branch_revision().await?);
+        dbg!(vcs.get_default_branch().await?);
+        dbg!(vcs.get_default_branch_revision().await?);
+
         Ok(None)
     }
 
