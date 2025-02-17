@@ -1,29 +1,37 @@
 use async_trait::async_trait;
 use moon_pdk_api::{
-    MoonContext, SyncWorkspaceInput, SyncWorkspaceOutput, ToolchainMetadataInput,
-    ToolchainMetadataOutput,
+    RegisterToolchainInput, RegisterToolchainOutput, SyncProjectInput, SyncProjectOutput,
+    SyncWorkspaceInput, SyncWorkspaceOutput,
 };
 use moon_plugin::{Plugin, PluginContainer, PluginId, PluginRegistration, PluginType};
 use proto_core::Tool;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, instrument};
+
+pub type ToolchainMetadata = RegisterToolchainOutput;
 
 pub struct ToolchainPlugin {
     pub id: PluginId,
-    pub metadata: ToolchainMetadataOutput,
+    pub metadata: ToolchainMetadata,
 
     plugin: Arc<PluginContainer>,
 
     #[allow(dead_code)]
-    tool: Option<Tool>,
+    tool: Option<RwLock<Tool>>,
 }
 
 impl ToolchainPlugin {
-    #[instrument(skip_all)]
+    pub async fn has_func(&self, func: &str) -> bool {
+        self.plugin.has_func(func).await
+    }
+
+    #[instrument(skip(self))]
     pub async fn sync_workspace(
         &self,
-        context: MoonContext,
+        input: SyncWorkspaceInput,
     ) -> miette::Result<Option<SyncWorkspaceOutput>> {
         if !self.plugin.has_func("sync_workspace").await {
             return Ok(None);
@@ -31,40 +39,37 @@ impl ToolchainPlugin {
 
         debug!(toolchain_id = self.id.as_str(), "Syncing workspace");
 
-        let output: SyncWorkspaceOutput = self
-            .plugin
-            .call_func_with("sync_workspace", SyncWorkspaceInput { context })
-            .await?;
+        let output: SyncWorkspaceOutput =
+            self.plugin.call_func_with("sync_workspace", input).await?;
+
+        debug!(toolchain_id = self.id.as_str(), "Synced workspace");
 
         Ok(Some(output))
     }
 
-    // #[instrument(skip_all)]
-    // pub async fn sync_project(
-    //     &self,
-    //     project: SyncProjectRecord,
-    //     dependencies: FxHashMap<Id, SyncProjectRecord>,
-    //     context: MoonContext,
-    // ) -> miette::Result<()> {
-    //     if !self.plugin.has_func("sync_project").await {
-    //         return Ok(());
-    //     }
+    #[instrument(skip(self))]
+    pub async fn sync_project(&self, input: SyncProjectInput) -> miette::Result<Vec<PathBuf>> {
+        let mut files = vec![];
 
-    //     debug!(toolchain_id = self.id.as_str(), "Syncing project");
+        if !self.plugin.has_func("sync_project").await {
+            return Ok(files);
+        }
 
-    //     self.plugin
-    //         .call_func_without_output(
-    //             "sync_project",
-    //             SyncProjectInput {
-    //                 context,
-    //                 dependencies,
-    //                 project,
-    //             },
-    //         )
-    //         .await?;
+        debug!(toolchain_id = self.id.as_str(), "Syncing project");
 
-    //     Ok(())
-    // }
+        let output: SyncProjectOutput = self.plugin.call_func_with("sync_project", input).await?;
+
+        for file in output.changed_files {
+            files.push(
+                file.real_path()
+                    .unwrap_or_else(|| self.plugin.from_virtual_path(&file)),
+            );
+        }
+
+        debug!(toolchain_id = self.id.as_str(), changed_files = ?files, "Synced project");
+
+        Ok(files)
+    }
 }
 
 #[async_trait]
@@ -72,10 +77,10 @@ impl Plugin for ToolchainPlugin {
     async fn new(registration: PluginRegistration) -> miette::Result<Self> {
         let plugin = Arc::new(registration.container);
 
-        let metadata: ToolchainMetadataOutput = plugin
+        let metadata: RegisterToolchainOutput = plugin
             .cache_func_with(
                 "register_toolchain",
-                ToolchainMetadataInput {
+                RegisterToolchainInput {
                     id: registration.id.to_string(),
                 },
             )
@@ -85,14 +90,14 @@ impl Plugin for ToolchainPlugin {
             // Only create the proto tool instance if we know that
             // the WASM file has support for it!
             tool: if plugin.has_func("register_tool").await {
-                Some(
+                Some(RwLock::new(
                     Tool::new(
                         registration.id.clone(),
                         Arc::clone(&registration.proto_env),
                         Arc::clone(&plugin),
                     )
                     .await?,
-                )
+                ))
             } else {
                 None
             },
